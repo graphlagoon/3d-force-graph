@@ -1,10 +1,8 @@
-import { AmbientLight, DirectionalLight, Vector3, REVISION } from 'three';
+import { AmbientLight, DirectionalLight, Vector3, Vector2, Raycaster, Plane, REVISION } from 'three';
 
 const three = window.THREE
   ? window.THREE // Prefer consumption from global THREE, if exists
-  : { AmbientLight, DirectionalLight, Vector3, REVISION };
-
-import { DragControls as ThreeDragControls } from 'three/examples/jsm/controls/DragControls.js';
+  : { AmbientLight, DirectionalLight, Vector3, Vector2, Raycaster, Plane, REVISION };
 
 import ThreeForceGraph from 'three-forcegraph';
 import ThreeRenderObjects from 'three-render-objects';
@@ -66,6 +64,7 @@ const linkedFGProps = Object.assign(...[
   'linkDirectionalParticleColor',
   'linkDirectionalParticleResolution',
   'linkDirectionalParticleThreeObject',
+  'useInstancedRendering',
   'forceEngine',
   'd3AlphaDecay',
   'd3VelocityDecay',
@@ -74,6 +73,7 @@ const linkedFGProps = Object.assign(...[
   'warmupTicks',
   'cooldownTicks',
   'cooldownTime',
+  'ticksPerFrame',
   'onEngineTick',
   'onEngineStop'
 ].map(p => ({ [p]: bindFG.linkProp(p)})));
@@ -167,12 +167,12 @@ export default Kapsule({
     },
     _animationCycle(state) {
       if (state.enablePointerInteraction) {
-        // reset canvas cursor (override dragControls cursor)
+        // reset canvas cursor (override drag cursor)
         this.renderer().domElement.style.cursor = null;
       }
 
       // Frame cycle
-      state.forceGraph.tickFrame();
+      state.forceGraph.tickFrame(state.renderObjs.camera());
       state.renderObjs.tick();
       state.animationFrameRequestId = requestAnimationFrame(this._animationCycle);
     },
@@ -241,127 +241,8 @@ export default Kapsule({
         }
       })
       .onFinishUpdate(() => {
-        // Setup node drag interaction
-        if (state._dragControls) {
-          const curNodeDrag = state.graphData.nodes.find(node => node.__initialFixedPos && !node.__disposeControlsAfterDrag); // detect if there's a node being dragged using the existing drag controls
-          if (curNodeDrag) {
-            curNodeDrag.__disposeControlsAfterDrag = true; // postpone previous controls disposal until drag ends
-          } else {
-            state._dragControls.dispose(); // cancel previous drag controls
-          }
-
-          state._dragControls = undefined;
-        }
-
-        if (state.enableNodeDrag && state.enablePointerInteraction && state.forceEngine === 'd3') { // Can't access node positions programmatically in ngraph
-          const dragControls = state._dragControls = new ThreeDragControls(
-            state.graphData.nodes.map(node => node.__threeObj).filter(obj => obj),
-            camera,
-            renderer.domElement
-          );
-
-          dragControls.addEventListener('dragstart', function (event) {
-            const nodeObj = getGraphObj(event.object);
-            if (!nodeObj) return;
-
-            controls.enabled = false; // Disable controls while dragging
-
-            // track drag object movement
-            event.object.__initialPos = event.object.position.clone();
-            event.object.__prevPos = event.object.position.clone();
-
-            const node = nodeObj.__data;
-            !node.__initialFixedPos && (node.__initialFixedPos = {fx: node.fx, fy: node.fy, fz: node.fz});
-            !node.__initialPos && (node.__initialPos = {x: node.x, y: node.y, z: node.z});
-
-            // lock node
-            ['x', 'y', 'z'].forEach(c => node[`f${c}`] = node[c]);
-
-            // drag cursor
-            renderer.domElement.classList.add('grabbable');
-          });
-
-          dragControls.addEventListener('drag', function (event) {
-            const nodeObj = getGraphObj(event.object);
-            if (!nodeObj) return;
-
-            if (!event.object.hasOwnProperty('__graphObjType')) {
-              // If dragging a child of the node, update the node object instead
-              const initPos = event.object.__initialPos;
-              const prevPos = event.object.__prevPos;
-              const newPos = event.object.position;
-
-              nodeObj.position.add(newPos.clone().sub(prevPos)); // translate node object by the motion delta
-              prevPos.copy(newPos);
-              newPos.copy(initPos); // reset child back to its initial position
-            }
-
-            const node = nodeObj.__data;
-            const newPos = nodeObj.position;
-            const translate = {x: newPos.x - node.x, y: newPos.y - node.y, z: newPos.z - node.z};
-            // Move fx/fy/fz (and x/y/z) of nodes based on object new position
-            ['x', 'y', 'z'].forEach(c => node[`f${c}`] = node[c] = newPos[c]);
-
-            state.forceGraph
-              .d3AlphaTarget(0.3) // keep engine running at low intensity throughout drag
-              .resetCountdown();  // prevent freeze while dragging
-
-            node.__dragged = true;
-            state.onNodeDrag(node, translate);
-          });
-
-          dragControls.addEventListener('dragend', function (event) {
-            const nodeObj = getGraphObj(event.object);
-            if (!nodeObj) return;
-
-            delete(event.object.__initialPos); // remove tracking attributes
-            delete(event.object.__prevPos);
-
-            const node = nodeObj.__data;
-
-            // dispose previous controls if needed
-            if (node.__disposeControlsAfterDrag) {
-              dragControls.dispose();
-              delete(node.__disposeControlsAfterDrag);
-            }
-
-            const initFixedPos = node.__initialFixedPos;
-            const initPos = node.__initialPos;
-            const translate = {x: initPos.x - node.x, y: initPos.y - node.y, z: initPos.z - node.z};
-            if (initFixedPos) {
-              ['x', 'y', 'z'].forEach(c => {
-                const fc = `f${c}`;
-                if (initFixedPos[fc] === undefined) {
-                  delete(node[fc])
-                }
-              });
-              delete(node.__initialFixedPos);
-              delete(node.__initialPos);
-              if (node.__dragged) {
-                delete(node.__dragged);
-                state.onNodeDragEnd(node, translate);
-              }
-            }
-
-            state.forceGraph
-              .d3AlphaTarget(0)   // release engine low intensity
-              .resetCountdown();  // let the engine readjust after releasing fixed nodes
-
-            if (state.enableNavigationControls) {
-              controls.enabled = true; // Re-enable controls
-
-              controls._status && controls._onPointerCancel?.(); // cancel pressed status on fly controls
-
-              controls.domElement && controls.domElement.ownerDocument && controls.domElement.ownerDocument.dispatchEvent(
-                // simulate mouseup to ensure the controls don't take over after dragend
-                new PointerEvent('pointerup', { pointerType: 'touch' })
-              );
-            }
-
-            // clear cursor
-            renderer.domElement.classList.remove('grabbable');
-          });
-        }
+        // Setup custom node drag (replaces DragControls for InstancedMesh support)
+        setupInstancedDrag(state, camera, renderer, controls);
       });
 
     // config renderObjs
@@ -378,14 +259,14 @@ export default Kapsule({
         const isNode = o => o.__graphObjType === 'node';
         return isNode(bObj) - isNode(aObj);
       })
-      .tooltipContent(obj => {
-        const graphObj = getGraphObj(obj);
+      .tooltipContent((obj, intersection) => {
+        const graphObj = getGraphObj(obj, intersection);
         return graphObj ? accessorFn(state[`${graphObj.__graphObjType}Label`])(graphObj.__data) || '' : '';
       })
       .hoverDuringDrag(false)
-      .onHover(obj => {
+      .onHover((obj, prevObj, intersection) => {
         // Update tooltip and trigger onHover events
-        const hoverObj = getGraphObj(obj);
+        const hoverObj = getGraphObj(obj, intersection);
 
         if (hoverObj !== state.hoverObj) {
           const prevObjType = state.hoverObj ? state.hoverObj.__graphObjType : null;
@@ -413,8 +294,13 @@ export default Kapsule({
         }
       })
       .clickAfterDrag(false)
-      .onClick((obj, ev) => {
-        const graphObj = getGraphObj(obj);
+      .onClick((obj, ev, intersection) => {
+        // Skip if drag just ended
+        if (state._dragJustEnded) {
+          state._dragJustEnded = false;
+          return;
+        }
+        const graphObj = getGraphObj(obj, intersection);
         if (graphObj) {
           const fn = state[`on${graphObj.__graphObjType === 'node' ? 'Node' : 'Link'}Click`];
           fn && fn(graphObj.__data, ev);
@@ -422,9 +308,9 @@ export default Kapsule({
           state.onBackgroundClick && state.onBackgroundClick(ev);
         }
       })
-      .onRightClick((obj, ev) => {
+      .onRightClick((obj, ev, intersection) => {
         // Handle right-click events
-        const graphObj = getGraphObj(obj);
+        const graphObj = getGraphObj(obj, intersection);
         if (graphObj) {
           const fn = state[`on${graphObj.__graphObjType === 'node' ? 'Node' : 'Link'}RightClick`];
           fn && fn(graphObj.__data, ev);
@@ -442,11 +328,237 @@ export default Kapsule({
 
 //
 
-function getGraphObj(object) {
+/**
+ * Resolve a raycasted Three.js object to a graph object.
+ * Handles both individual meshes (custom nodes) and InstancedMesh (instanced nodes/links).
+ */
+function getGraphObj(object, intersection) {
+  if (!object) return null;
+
+  // Walk up the parent chain to find an object with __graphObjType
   let obj = object;
-  // recurse up object chain until finding the graph object
   while (obj && !obj.hasOwnProperty('__graphObjType')) {
     obj = obj.parent;
   }
+
+  if (!obj) return null;
+
+  // If this is an instanced renderer, resolve the specific instance data
+  if (obj.__isInstancedRenderer && intersection && intersection.instanceId !== undefined) {
+    const renderer = obj.__instancedRenderer;
+    const data = renderer.getDataByInstanceId(intersection.instanceId);
+    if (data) {
+      // Return a virtual graph object proxy with the same interface
+      return {
+        __graphObjType: obj.__graphObjType,
+        __data: data,
+        __instanceId: intersection.instanceId,
+        __instancedRenderer: renderer,
+      };
+    }
+    return null;
+  }
+
   return obj;
+}
+
+/**
+ * Custom drag system for InstancedMesh + individual mesh nodes.
+ * Replaces Three.js DragControls which requires individual mesh objects.
+ */
+function setupInstancedDrag(state, camera, renderer, controls) {
+  // Clean up previous drag handlers
+  if (state._dragCleanup) {
+    state._dragCleanup();
+  }
+
+  if (!state.enableNodeDrag || !state.enablePointerInteraction || state.forceEngine !== 'd3') {
+    return;
+  }
+
+  let dragging = false;
+  let dragNode = null;
+  let pendingDragNode = null; // node under pointer on pointerdown, before drag threshold
+  let pendingDragHit = null;  // hit info for pending drag
+  let pointerDownPos = null;  // screen coords at pointerdown for threshold check
+  const DRAG_THRESHOLD = 4;   // pixels of movement before drag starts
+  const dragPlane = new three.Plane();
+  const dragOffset = new three.Vector3();
+  const dragIntersection = new three.Vector3();
+  const raycaster = new three.Raycaster();
+  const pointer = new three.Vector2();
+
+  function getPointerPos(ev) {
+    const rect = renderer.domElement.getBoundingClientRect();
+    pointer.x = ((ev.clientX - rect.left) / rect.width) * 2 - 1;
+    pointer.y = -((ev.clientY - rect.top) / rect.height) * 2 + 1;
+  }
+
+  /**
+   * Find a node under the pointer by raycasting against all objects in the scene.
+   */
+  function findNodeUnderPointer(ev) {
+    getPointerPos(ev);
+    raycaster.setFromCamera(pointer, camera);
+
+    // Raycast against the force graph scene (includes instanced meshes + individual meshes)
+    const intersects = raycaster.intersectObjects([state.forceGraph], true);
+
+    for (const hit of intersects) {
+      const obj = hit.object;
+
+      // Check InstancedMesh node renderer
+      if (obj.__isInstancedRenderer && obj.__graphObjType === 'node' && hit.instanceId !== undefined) {
+        const nodeData = obj.__instancedRenderer.getDataByInstanceId(hit.instanceId);
+        if (nodeData) return { node: nodeData, point: hit.point };
+      }
+
+      // Check individual custom nodes (cluster shapes etc.)
+      const graphObj = getGraphObj(obj, hit);
+      if (graphObj && graphObj.__graphObjType === 'node') {
+        return { node: graphObj.__data, point: hit.point };
+      }
+    }
+    return null;
+  }
+
+  function onPointerDown(ev) {
+    if (ev.button !== 0) return; // left click only
+    if (!state.enableNodeDrag) return;
+
+    const hit = findNodeUnderPointer(ev);
+    if (!hit) return;
+
+    // Don't start dragging yet — just record the candidate.
+    // Drag starts only after pointer moves beyond DRAG_THRESHOLD.
+    // This lets simple clicks pass through to three-render-objects cleanly.
+    pendingDragNode = hit.node;
+    pendingDragHit = hit;
+    pointerDownPos = { x: ev.clientX, y: ev.clientY };
+  }
+
+  function startDrag() {
+    dragging = true;
+    dragNode = pendingDragNode;
+
+    // Disable orbit controls now that real drag is starting
+    controls.enabled = false;
+
+    // Set up drag plane perpendicular to camera direction at node depth
+    const cameraDir = new three.Vector3();
+    camera.getWorldDirection(cameraDir);
+    dragPlane.setFromNormalAndCoplanarPoint(cameraDir, pendingDragHit.point);
+
+    // Offset from click point to node center
+    const nodePos = new three.Vector3(dragNode.x || 0, dragNode.y || 0, dragNode.z || 0);
+    dragOffset.subVectors(nodePos, pendingDragHit.point);
+
+    // Store initial positions and pin node
+    dragNode.__initialFixedPos = { fx: dragNode.fx, fy: dragNode.fy, fz: dragNode.fz };
+    dragNode.__initialPos = { x: dragNode.x, y: dragNode.y, z: dragNode.z };
+    ['x', 'y', 'z'].forEach(c => dragNode[`f${c}`] = dragNode[c]);
+    renderer.domElement.classList.add('grabbable');
+
+    // Clear pending state
+    pendingDragNode = null;
+    pendingDragHit = null;
+    pointerDownPos = null;
+  }
+
+  function onPointerMove(ev) {
+    // Check if pending drag should start (threshold exceeded)
+    if (pendingDragNode && pointerDownPos) {
+      const dx = ev.clientX - pointerDownPos.x;
+      const dy = ev.clientY - pointerDownPos.y;
+      if (dx * dx + dy * dy >= DRAG_THRESHOLD * DRAG_THRESHOLD) {
+        startDrag();
+      }
+    }
+
+    if (!dragging || !dragNode) return;
+
+    getPointerPos(ev);
+    raycaster.setFromCamera(pointer, camera);
+
+    if (raycaster.ray.intersectPlane(dragPlane, dragIntersection)) {
+      const newPos = dragIntersection.add(dragOffset);
+
+      const translate = {
+        x: newPos.x - dragNode.x,
+        y: newPos.y - dragNode.y,
+        z: newPos.z - dragNode.z,
+      };
+
+      ['x', 'y', 'z'].forEach(c => dragNode[`f${c}`] = dragNode[c] = newPos[c]);
+
+      state.forceGraph
+        .d3AlphaTarget(0.3)
+        .resetCountdown();
+
+      dragNode.__dragged = true;
+      state.onNodeDrag(dragNode, translate);
+    }
+  }
+
+  function onPointerUp(ev) {
+    // Clear pending drag (user clicked without dragging — let three-render-objects handle click)
+    if (pendingDragNode) {
+      pendingDragNode = null;
+      pendingDragHit = null;
+      pointerDownPos = null;
+    }
+
+    if (!dragging) return;
+    dragging = false;
+
+    if (dragNode) {
+      const initFixedPos = dragNode.__initialFixedPos;
+      const initPos = dragNode.__initialPos;
+
+      if (initFixedPos) {
+        // Restore original fixed positions (unpin unless originally pinned)
+        ['x', 'y', 'z'].forEach(c => {
+          const fc = `f${c}`;
+          if (initFixedPos[fc] === undefined) {
+            delete dragNode[fc];
+          }
+        });
+
+        const translate = {
+          x: (initPos ? initPos.x : 0) - dragNode.x,
+          y: (initPos ? initPos.y : 0) - dragNode.y,
+          z: (initPos ? initPos.z : 0) - dragNode.z,
+        };
+        state.onNodeDragEnd(dragNode, translate);
+        state._dragJustEnded = true; // Prevent click from firing
+
+        state.forceGraph
+          .d3AlphaTarget(0)
+          .resetCountdown();
+
+        delete dragNode.__initialFixedPos;
+        delete dragNode.__initialPos;
+        delete dragNode.__dragged;
+      }
+
+      dragNode = null;
+    }
+
+    if (state.enableNavigationControls) {
+      controls.enabled = true;
+    }
+
+    renderer.domElement.classList.remove('grabbable');
+  }
+
+  renderer.domElement.addEventListener('pointerdown', onPointerDown);
+  renderer.domElement.addEventListener('pointermove', onPointerMove);
+  renderer.domElement.addEventListener('pointerup', onPointerUp);
+
+  // Store cleanup function for next call
+  state._dragCleanup = () => {
+    renderer.domElement.removeEventListener('pointerdown', onPointerDown);
+    renderer.domElement.removeEventListener('pointermove', onPointerMove);
+    renderer.domElement.removeEventListener('pointerup', onPointerUp);
+  };
 }
